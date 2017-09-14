@@ -401,7 +401,7 @@ struct tcf_ematch_ops;
 
 /**
  * struct tcf_ematch - extended match (ematch)
- * 
+ *
  * @matchid: identifier to allow userspace to reidentify a match
  * @flags: flags specifying attributes and the relation to other matches
  * @ops: the operations lookup table of the corresponding ematch module
@@ -450,7 +450,7 @@ static inline int tcf_em_early_end(struct tcf_ematch *em, int result)
 
 	return 0;
 }
-	
+
 /**
  * struct tcf_ematch_tree - ematch tree handle
  *
@@ -460,12 +460,12 @@ static inline int tcf_em_early_end(struct tcf_ematch *em, int result)
 struct tcf_ematch_tree {
 	struct tcf_ematch_tree_hdr hdr;
 	struct tcf_ematch *	matches;
-	
+
 };
 
 /**
  * struct tcf_ematch_ops - ematch module operations
- * 
+ *
  * @kind: identifier (kind) of this ematch module
  * @datalen: length of expected configuration data (optional)
  * @change: called during validation (optional)
