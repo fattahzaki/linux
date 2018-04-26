@@ -19,11 +19,6 @@
 #include <net/pkt_sched.h>
 #include <net/sock.h>
 
-/* A dynamic clockid is invalid if bits 0, 1, 2 are set as described by
- * posix-timers.h. We use that as the 'default' clockid to flag an error if
- * the application tries to set any clock for the full HW offload case.
- */
-#define DYNAMIC_CLOCKID_INVALID (BIT(31) | BIT(2) | BIT(1) | BIT(0))
 #define SORTING_IS_ON(x) (x->flags & TC_TBS_SORTING_ON)
 #define DEADLINE_MODE_IS_ON(x) (x->flags & TC_TBS_DEADLINE_MODE_ON)
 #define OFFLOAD_IS_ON(x) (x->flags & TC_TBS_OFFLOAD_ON)
@@ -72,8 +67,8 @@ static inline int validate_input_params(struct tc_tbs_qopt *qopt,
 		NL_SET_ERR_MSG(extack, "Cannot disable sorting for this mode");
 		return -EINVAL;
 	} else if (SORTING_IS_ON(qopt)) {
-		if (qopt->clockid >= MAX_CLOCKS) {
-			NL_SET_ERR_MSG(extack, "Invalid clockid");
+		if (qopt->clockid != CLOCK_TAI) {
+			NL_SET_ERR_MSG(extack, "Invalid clockid. CLOCK_TAI must be used");
 			return -EINVAL;
 		} else if (qopt->clockid < 0) {
 			NL_SET_ERR_MSG(extack, "Clockid is not supported");
@@ -90,10 +85,8 @@ static inline int validate_input_params(struct tc_tbs_qopt *qopt,
 				       "Cannot set delta for this mode");
 			return -EINVAL;
 		}
-		if ((qopt->clockid & DYNAMIC_CLOCKID_INVALID) !=
-		    DYNAMIC_CLOCKID_INVALID) {
-			NL_SET_ERR_MSG(extack,
-				       "Cannot set clockid for this mode");
+		if (qopt->clockid != CLOCK_TAI) {
+			NL_SET_ERR_MSG(extack, "clockid must be CLOCK_TAI for this mode");
 			return -EINVAL;
 		}
 	}
