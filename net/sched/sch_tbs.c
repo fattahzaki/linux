@@ -19,10 +19,17 @@
 #include <net/pkt_sched.h>
 #include <net/sock.h>
 
+/* A dynamic clockid is invalid if bits 0, 1, 2 are set as described by
+ * posix-timers.h. We use that as the 'default' clockid to flag an error if
+ * the application tries to set any clock for the full HW offload case.
+ */
+#define DYNAMIC_CLOCKID_INVALID (BIT(31) | BIT(2) | BIT(1) | BIT(0))
 #define SORTING_IS_ON(x) (x->flags & TC_TBS_SORTING_ON)
 #define DEADLINE_MODE_IS_ON(x) (x->flags & TC_TBS_DEADLINE_MODE_ON)
+#define OFFLOAD_IS_ON(x) (x->flags & TC_TBS_OFFLOAD_ON)
 
 struct tbs_sched_data {
+	bool offload;
 	bool sorting;
 	bool deadline_mode;
 	int clockid;
@@ -49,20 +56,46 @@ static inline int validate_input_params(struct tc_tbs_qopt *qopt,
 	 *
 	 *	* If sorting is ON, then clockid and delta must be valid.
 	 *
+	 *	* If HW offload is ON and sorting is OFF, then clockid and
+	 *	  delta must not have been set. We can't expect that system
+	 *	  clocks have been synchronized to PHC, so we must assume that
+	 *	  the application has taken full responsibility to handle
+	 *	  clocks directly, and that a packet's txtime is already based
+	 *	  on the PHC. For that reason, deadline mode can't be used as
+	 *	  the qdisc can't adjust the packet's tstamp on the passthrough
+	 *	  dequeue flow.
+	 *
 	 *	* Dynamic clockids are not supported.
 	 *	* Delta must be a positive integer.
 	 */
-	if (qopt->clockid >= MAX_CLOCKS) {
-		NL_SET_ERR_MSG(extack, "Invalid clockid");
+	if (!OFFLOAD_IS_ON(qopt) && !SORTING_IS_ON(qopt)) {
+		NL_SET_ERR_MSG(extack, "Cannot disable sorting for this mode");
 		return -EINVAL;
-	} else if (qopt->clockid < 0) {
-		NL_SET_ERR_MSG(extack, "Clockid is not supported");
-		return -ENOTSUPP;
-	}
+	} else if (SORTING_IS_ON(qopt)) {
+		if (qopt->clockid >= MAX_CLOCKS) {
+			NL_SET_ERR_MSG(extack, "Invalid clockid");
+			return -EINVAL;
+		} else if (qopt->clockid < 0) {
+			NL_SET_ERR_MSG(extack, "Clockid is not supported");
+			return -ENOTSUPP;
+		}
 
-	if (qopt->delta < 0) {
-		NL_SET_ERR_MSG(extack, "Delta must be positive");
-		return -EINVAL;
+		if (qopt->delta < 0) {
+			NL_SET_ERR_MSG(extack, "Delta must be positive");
+			return -EINVAL;
+		}
+	} else {
+		if (qopt->delta != 0) {
+			NL_SET_ERR_MSG(extack,
+				       "Cannot set delta for this mode");
+			return -EINVAL;
+		}
+		if ((qopt->clockid & DYNAMIC_CLOCKID_INVALID) !=
+		    DYNAMIC_CLOCKID_INVALID) {
+			NL_SET_ERR_MSG(extack,
+				       "Cannot set clockid for this mode");
+			return -EINVAL;
+		}
 	}
 
 	return 0;
@@ -141,6 +174,11 @@ static int tbs_enqueue(struct sk_buff *nskb, struct Qdisc *sch,
 	return q->enqueue(nskb, sch);
 }
 
+static int tbs_enqueue_fifo(struct sk_buff *nskb, struct Qdisc *sch)
+{
+	return qdisc_enqueue_tail(nskb, sch);
+}
+
 static int tbs_enqueue_timesortedlist(struct sk_buff *nskb, struct Qdisc *sch)
 {
 	struct tbs_sched_data *q = qdisc_priv(sch);
@@ -207,6 +245,17 @@ static struct sk_buff *tbs_dequeue(struct Qdisc *sch)
 	return q->dequeue(sch);
 }
 
+static struct sk_buff *tbs_dequeue_fifo(struct Qdisc *sch)
+{
+	struct tbs_sched_data *q = qdisc_priv(sch);
+	struct sk_buff *skb = qdisc_dequeue_head(sch);
+
+	if (skb)
+		q->last = skb->tstamp;
+
+	return skb;
+}
+
 static struct sk_buff *tbs_dequeue_timesortedlist(struct Qdisc *sch)
 {
 	struct tbs_sched_data *q = qdisc_priv(sch);
@@ -251,12 +300,66 @@ out:
 	return skb;
 }
 
+static void tbs_disable_offload(struct net_device *dev,
+				struct tbs_sched_data *q)
+{
+	struct tc_tbs_qopt_offload tbs = { };
+	const struct net_device_ops *ops;
+	int err;
+
+	if (!q->offload)
+		return;
+
+	ops = dev->netdev_ops;
+	if (!ops->ndo_setup_tc)
+		return;
+
+	tbs.queue = q->queue;
+	tbs.enable = 0;
+
+	err = ops->ndo_setup_tc(dev, TC_SETUP_QDISC_TBS, &tbs);
+	if (err < 0)
+		pr_warn("Couldn't disable TBS offload for queue %d\n",
+			tbs.queue);
+}
+
+static int tbs_enable_offload(struct net_device *dev, struct tbs_sched_data *q,
+			      struct netlink_ext_ack *extack)
+{
+	const struct net_device_ops *ops = dev->netdev_ops;
+	struct tc_tbs_qopt_offload tbs = { };
+	int err;
+
+	if (q->offload)
+		return 0;
+
+	if (!ops->ndo_setup_tc) {
+		NL_SET_ERR_MSG(extack, "Specified device does not support TBS offload");
+		return -EOPNOTSUPP;
+	}
+
+	tbs.queue = q->queue;
+	tbs.enable = 1;
+
+	err = ops->ndo_setup_tc(dev, TC_SETUP_QDISC_TBS, &tbs);
+	if (err < 0) {
+		NL_SET_ERR_MSG(extack, "Specified device failed to setup TBS hardware offload");
+		return err;
+	}
+
+	return 0;
+}
+
 static inline void setup_queueing_mode(struct tbs_sched_data *q)
 {
 	if (q->sorting) {
 		q->enqueue = tbs_enqueue_timesortedlist;
 		q->dequeue = tbs_dequeue_timesortedlist;
 		q->peek = tbs_peek_timesortedlist;
+	} else if (q->offload) {
+		q->enqueue = tbs_enqueue_fifo;
+		q->dequeue = tbs_dequeue_fifo;
+		q->peek = qdisc_peek_head;
 	}
 }
 
@@ -286,8 +389,9 @@ static int tbs_init(struct Qdisc *sch, struct nlattr *opt,
 
 	qopt = nla_data(tb[TCA_TBS_PARMS]);
 
-	pr_debug("delta %d clockid %d sorting %s deadline %s\n",
+	pr_debug("delta %d clockid %d offload %s sorting %s deadline %s\n",
 		 qopt->delta, qopt->clockid,
+		 OFFLOAD_IS_ON(qopt) ? "on" : "off",
 		 SORTING_IS_ON(qopt) ? "on" : "off",
 		 DEADLINE_MODE_IS_ON(qopt) ? "on" : "off");
 
@@ -297,9 +401,16 @@ static int tbs_init(struct Qdisc *sch, struct nlattr *opt,
 
 	q->queue = sch->dev_queue - netdev_get_tx_queue(dev, 0);
 
+	if (OFFLOAD_IS_ON(qopt)) {
+		err = tbs_enable_offload(dev, q, extack);
+		if (err < 0)
+			return err;
+	}
+
 	/* Everything went OK, save the parameters used. */
 	q->delta = qopt->delta;
 	q->clockid = qopt->clockid;
+	q->offload = OFFLOAD_IS_ON(qopt);
 	q->sorting = SORTING_IS_ON(qopt);
 	q->deadline_mode = DEADLINE_MODE_IS_ON(qopt);
 
@@ -321,10 +432,14 @@ static int tbs_init(struct Qdisc *sch, struct nlattr *opt,
 		return -ENOTSUPP;
 	}
 
-	/* Select queueing mode based on parameters. */
+	/* Select queueing mode based on offload and sorting parameters. */
 	setup_queueing_mode(q);
 
-	qdisc_watchdog_init_clockid(&q->watchdog, sch, q->clockid);
+	/* The watchdog will be needed for SW best-effort or if TxTime
+	 * based sorting is on.
+	 */
+	if (!q->offload || q->sorting)
+		qdisc_watchdog_init_clockid(&q->watchdog, sch, q->clockid);
 
 	return 0;
 }
@@ -366,10 +481,13 @@ static void tbs_reset(struct Qdisc *sch)
 static void tbs_destroy(struct Qdisc *sch)
 {
 	struct tbs_sched_data *q = qdisc_priv(sch);
+	struct net_device *dev = qdisc_dev(sch);
 
 	/* Only cancel watchdog if it's been initialized. */
 	if (q->watchdog.qdisc == sch)
 		qdisc_watchdog_cancel(&q->watchdog);
+
+	tbs_disable_offload(dev, q);
 }
 
 static int tbs_dump(struct Qdisc *sch, struct sk_buff *skb)
@@ -384,6 +502,9 @@ static int tbs_dump(struct Qdisc *sch, struct sk_buff *skb)
 
 	opt.delta = q->delta;
 	opt.clockid = q->clockid;
+	if (q->offload)
+		opt.flags |= TC_TBS_OFFLOAD_ON;
+
 	if (q->sorting)
 		opt.flags |= TC_TBS_SORTING_ON;
 
