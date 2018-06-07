@@ -160,4 +160,20 @@ struct tc_tbs_qopt_offload {
 	s32 queue;
 };
 
+struct tc_taprio_sched_entry {
+	u32 index;
+	u8 command;
+	u32 gate_mask;
+	u32 interval;
+};
+
+struct tc_taprio_qopt_offload {
+	s64 base_time;
+	s64 cycle_time;
+	s64 extension_time;
+	u32 preempt_mask;
+	size_t num_entries;
+	struct tc_taprio_sched_entry entries[0];
+};
+
 #endif
